@@ -1,0 +1,325 @@
+This report is to disclose a new transaction-relay jamming attack <br>
+affecting bitcoin time-sensitive contracting protocols by exploiting the transaction <br>
+selection, announcement and propagation mechanisms of base-layer full-nodes. <br>
+<br>
+Back in 2020, amid numerous technical conversations among bitcoin protocol developers <br>
+about how bip125 replace-by-fee rules could be abused by a lightning channel counterparty <br>
+with a competing interest (a.k.a pinning attack, see BIP431's motivation for more), it <br>
+was thought that few other components of the bitcoin tx-relay p2p stack could be also <br>
+adversarially exploited [0] (In the lack of familiarity with lightning / contracting <br>
+protocol security risks, go to read the old post pointed by footnote). <br>
+<br>
+Mid-2023, I did privately message a group of long-term bitcoin and lightning <br>
+developers detailing those new "transaction-relay throughput attacks" concerns, <br>
+especially the different exploitations and the technical feasibility of such attack. <br>
+<br>
+While this attack was deemed worthy of more investigations and practical testing, it <br>
+was relatively put in the background due to more severe security issues affecting <br>
+lightning at the time (i.e 2023). Recent conversations this year (i.e 2024) about <br>
+free relay attacks of full-node bandwidths made me think to reconsider the practical <br>
+cost of transaction-relay throughput attacks, and as such proceeds to a full disclosure. <br>
+<br>
+Since my personal awareness in 2020 of this potential vector of attack enabling to <br>
+steal funds from lightning channel funds, I've not seen exploitations in the wild or <br>
+corresponding hints that could reveal such new transaction-relay jamming attack <br>
+being practically used. <br>
+<br>
+In this report, 2 variations of those new "transaction-relay throughput attacks" <br>
+are presented, i.e respectively the "high overflow" and the "low overflow" variant. <br>
+There is a proof-of-concept available for the "high overflow" variation tested on <br>
+bitcoin core v27.0. The "high overflow" variation has been tested under few topological <br>
+configurations, though no under real-world workload. Coming with a proof-of-concept <br>
+to demonstrate the feasibility of the 2nd variation stays an open subject of investigation. <br>
+(see corresponding subsection for more). <br>
+<br>
+After conversation with few lightning maintainers, it arises as a main conclusion <br>
+that currently deployed random rebroadcast of time-sensitive transactions was probably <br>
+one of the most effective mitigation that could be solely deployed by lightning <br>
+implementation themselves. In this report, 2 variations of those new "transaction-relay <br>
+throughput attacks" are presented, i.e respectively the "high overflow" and "low overflow" <br>
+variants. <br>
+<br>
+At the time of writing, the "high overflow" attack cost is evaluated to be around <br>
+$80k to target real-world lightning channels with safety timelocks in the the order <br>
+of four dozen of blocks. <br>
+<br>
+In my reasonable opinion, I believe this new transaction-relay jamming attack can <br>
+be as much severe than already known state of the art non-mitigated attacks against <br>
+lightning channels while minding the junk transaction traffic cost. However more <br>
+investigations of this transaction-relay throughput attack vector can be very valuable. <br>
+<br>
+This new off-chain protocol attack vector is tracked by the CVE-2024-55563, <br>
+under a single identifier for a "multiple software, same protocol / attack vector". <br>
+<br>
+<h4> ## Background: Transaction-Relay Selection, Announcement & Propagation </h4>
+<br>
+At the protocol-level, summarily the transaction relay flow works in the following way. <br>
+On initially broadcasting a transaction, the full-node will issue an INV(inventory_set) <br>
+to all its connected peers. Considering strictly transaction-relay messages, this inventory <br>
+set is composed of either MSG_TX (non-wtxidrelay peers) or MSG_WTX (bip339 wtxidrelay peers), <br>
+up to the inventory set limit (if the full-node implements any such inventory set limit). <br>
+<br>
+For all the transaction identifiers announced in the inventory set, that are not normally <br>
+not already present in the peer inventory or caches at large, the peer will reply to the <br>
+node with a GETDATA(requested_set(MSG_TX)) or GETDATA(requested_set(MSG_WTX)) message. For <br>
+each element in the requested set of transactions, the node can forward an individual final <br>
+TX message to the peer. <br>
+<br>
+The background description is realized using bitcoin core v28.0rc1 - commit 88f0419c1, <br>
+and it assumed to be run similarly by the node and it's connected transaction-relay peers. <br>
+<br>
+At the implementation-level, bitcoin core presents a number of interfaces to natively <br>
+relay a transaction in the peer-to-peer network, though I'll only give the background <br>
+for 2 of them. Both those interfaces jointly drop transactions identifiers in the same <br>
+buffer, i.e the "forward transaction inventory" (`m_tx_inventory_to_send`). <br>
+<br>
+The 1st) interface examined is the RPC method `sendrawtransaction()`, where a raw <br>
+transaction is shared for broadcast by the node (e.g by the wallet). The `BroadcastTransaction()` <br>
+is called and within this method correspondingly the logic to accept the single <br>
+message with a TX message (`ProcessTransaction()` / `AcceptToMemoryPool()`) and the <br>
+logic to relay the transasction over the peer-to-peer network (`RelayTransaction()`). <br>
+The second part, i.e the transaction relay logic is the one inserting the transaction <br>
+identifier in the forward transaction inventory of each connected transaction-relay peer. <br>
+<br>
+The 2nd) interface examined is the TX message reception (`NetMsgType::TX`), where <br>
+a raw transaction is received from any connected peer. The transaction should be processed <br>
+by the mempool logic (`ProcessTransaction()`) and if it is accepted it's going to <br>
+be propagated to the remainder of the network (`ProcessValidTx()` / RelayTransaction()`), <br>
+by inserting the transaction identifier in the "forward transaction inventory". <br>
+<br>
+Come after the transaction selection phase that yield the set of transactions <br>
+to be the object of an INV message to the connected transaction-relay peers. This <br>
+phase is modulated for each connected peer and happens at periodic ticks (`m_next_inv_send_time`). <br>
+During this transaction selection phase, the transactions are topologically ordered <br>
+and fee-rate sorted out from the peer's "forward transaction inventory" (`m_tx_inventory_to_send`). <br>
+<br>
+This sorted inventory set is then drained up until reaching the INVENTORY_BROADCAST_MAX <br>
+limit (at max: 1000 transactions), and the transaction identifiers are assembled in <br>
+an INV message (either using MSG_TX or MSG_WTX) to be then communicated to the connected <br>
+transaction-relay peers. <br>
+<br>
+After this selection phase, comes the announcement phase on the side of the node's peer. <br>
+At reception of an INV message, the inventory_set received is sorted out, and if the <br>
+inventory element is a transaction (`IsGenTxMsg()`), the transaction identifier is <br>
+processed (`AddTxAnnouncement()`), and if the MAX_PEER_TX_ANNOUNCEMENTS limit is not <br>
+reached, the transaction is queued by the transaction requester (`TxRequestTracker`). <br>
+<br>
+If the transaction has been uniquely announced by the node, the peer should issue <br>
+a GETDATA download in the future time, driven by the requester logic (`GetRequestable()`). <br>
+If the transactions are announced by the node, faster than the peer can fetch and <br>
+download them, the MAX_PEER_TX_ANNOUNCEMENTS limit provokes transaction to be dropped <br>
+on the floor. <br>
+<br>
+The two limits INVENTORY_BROADCAST_MAX and MAX_PEER_TX_ANNOUNCEMENTS are the targeted <br>
+components by "transaction-throughput overflow attacks" and there will be further analyzed. <br>
+<br>
+<h4> ## Problem: Pre-Signed Time-Sensitive Transactions and Bounded Transaction-Relay Throughput </h4>
+<br>
+There are 2 variations of transaction-relay throughput overflow attacks identified so far, <br>
+respectively a "high overflow" attack and a "low overflow" attack. The explanation is started <br>
+by a "high overflow" attack. <br>
+<br>
+<h5>### "High-Overflow" Transaction-Relay Throughput Attack </h5>
+<br>
+In a "high overflow" attack, the goal of the adversary is to leverage the fee-rate sort <br>
+of the "forward transaction inventory" and the INVENTORY_BROADCAST_MAX to artificially <br>
+stuck down a subset of received transactions in the "forward transaction inventory". <br>
+<br>
+The attack works in the following fashion against a Lightning routing node: <br>
+- there is the Mallet, Alice, Mallory channel topology <br>
+- Mallet routes a 0.5 BTC HTLC to Mallory through Alice with an interval timelock <br>
+- Alice and Mallory pre-signs the commitment + HTLC 2nd stage transaction at 5 sat / vbytes <br>
+- at the base-layer level, Alice full-node is connected by 45 inbound peers controlled by Malicia <br>
+- at the base-layer level, Alice is connected with a honest transaction-relay peer Bob <br>
+- Malicia injects 2300 small-size transactions at 10 sat / vbytes for each of the 45 inbound peers <br>
+- at time of the outbound HTLC expiration, Mallory breaks the channel with Alice, commitment + HTLC 2nd stage transactions are broadcast by Alice <br>
+- the constantly injected transaction traffic prevents lightning channel transactions to propagate on the Alice-Bob link <br>
+- after the interval timelock of blocks have been swallowed, the inbound HTLC is timeout by Mallet, the outbound HTLC is claimed by Mallory <br>
+<br>
+Independently of transaction rebroadcast done by Alice lightning node, as long as it's done <br>
+at the same feerate, it still falls under the feerate threshold in the "forward transaction <br>
+inventory" generated by the throughput overflow traffic. <br>
+<br>
+There is a simplified proof-of-concept of the high overflow of the feerate sorting <br>
+of an alice node's "forward transaction inventory" available here. Tested on a v27.0 <br>
+bitcoin core software - commit d822839: <br>
+<br>
+https://github.com/ariard/bitcoin/commit/8fc559a4bcd0a2ef8bb4c50aa540a5c4c61a310a <br>
+<br>
+Note, in this example the feerate parameters are different ('effective-feerate'), i.e <br>
+"0.00010416" for the jammed transaction target and "0.00002083" and for the junk traffic <br>
+originating from the feedeer connection nodes. Running the test for a few attempt, yield <br>
+around ~2000 transactions, which is consistent with the INVENTORY_BROADCAST_PER_SECOND limit <br>
+of 7 transactions second, or i.e 4200 transactions per average block. <br>
+<br>
+Let's assume safety targeted timelocks are around 40 blocks (which is done by default by <br>
+some lightning network implementations), and the time-sensitive transactions are pre-signed <br>
+at 5 sat / virtual byte. If the individual transaction are of size 100 bytes, the throughput <br>
+overflow traffic is pre-signed at 10 sat / virtual byte, the attack liquidity cost is <br>
+estimated to be at 2_100_000 or $2k per block of delay. For a duration of 40 blocks, the <br>
+cost is estimated to be at 840_00_000 satoshis or $80_000. <br>
+<br>
+There are 3 observations to be made on this attack liquidity cost. <br>
+<br>
+Firstly, the adversary can partition the victim's full-node mempool from the rest <br>
+of the peer-to-peer network to avoid the throughput overflow transaction traffic to <br>
+be effectively burned as on-chain miners fees. All the overflow transaction traffic <br>
+can be children junk that have a parent in the victim's people (Alice), but not in <br>
+its connected transaction-relay peers (Bob). <br>
+<br>
+Secondly, the adversary can batch the liquidity cost to target a concurrent number <br>
+of lightning channels as lightning routing nodes are operating channels dissociately <br>
+in the lightning network. The throughput overflow limits, if bitcoin core is run <br>
+by default as a full-nodes, can be reached with a single contingent of junk transactions <br>
+originating from a unique UTXO set. <br>
+<br>
+Thirdly, the adversary could recycle the traffic of junk children transactions <br>
+to lower the liquidity cost of the overall attack to few blocks of buffer, by <br>
+periodically spending the parent in the partitioned mempool to a new confirmed <br>
+UTXO, and re-generate a layout of junk children transactions. <br>
+<br>
+<h5>### "Low-Overflow" Transaction-Relay Throughput Attack</h5>
+<br>
+In a "low overflow" attack, the goal of the adversary is to leverage the <br>
+MAX_PEER_TX_ANNOUCEMENTS limit until the inbound transactions received by <br>
+the peer from a node overflows this limit and subsequently provokes a drop <br>
+of the ulterior inbound transaction traffic. <br>
+<br>
+This attack has been tested under few topological configurations of the <br>
+transaction-relay peer-to-peer network, where the MAX_PEER_TX_ANNOUNCEMENTS <br>
+inbound limit of a target transaction-relay link is attempted to be overflowed. <br>
+<br>
+Let's consider the following transaction-relay network topology: Alice <---> Bob. <br>
+<br>
+Alice and Bob are 2 transaction-relay peers and both of them are running v28.0rc1. <br>
+It is assumed there are supporting wtxidrelay on their connections and that Alice <br>
+opened the connection to Bob (from Alice's node viewpoint Bob is an outbound peer <br>
+or an OUTBOUND_FULL_RELAY). <br>
+<br>
+The name of the game for a "low-overflow" adversary is to open many inbound connections <br>
+to Alice node, and inject a high-number of junk transactions to reach Alice's "ingress" <br>
+limit of MAX_PEER_TX_ANNOUNCEMENTS on each of those inbound connections. As such trying <br>
+to attain Bob's own MAX_PEER_TX_ANNOUNCEMENTS's limit on Alice and Bob link. <br>
+<br>
+Reconsidering the Alice and Bob's topology, let's enrich it with a number of <br>
+puppets nodes, and there will be the following topology: <br>
+- Mallet <---> Alice <br>
+- Mallory <---> Alice <br>
+- Malicia <---> Alice <br>
+<br>
+All those 3 puppets inbound nodes are supporting wtxidrelay on theirs connections <br>
+and they are the ones opening connections to Alice (from Alice's node viewpoint <br>
+Mallet, Mallory and Malicia are all inbound peers, from Bob's node viewpoint they <br>
+are completely unrelated peers an ADDR message might not even exist for them). <br>
+<br>
+Each of this peer can announce and transaction-relay up to 5000 unique and <br>
+new transactions to Alice so an "ingress" total of 15k transactions, while <br>
+the "egress" on the Alice-Bob link is still only 5000 transactions. <br>
+<br>
+Repeating the trick in the 1st observation about partitoning full-node mempools, <br>
+all the transactions might not connect on Bob's mempool, as such the only way <br>
+for Bob to "discover" it is through announcements on the Alice-Bob link. <br>
+<br>
+This network topology configuration has been tested, while none so far <br>
+triggering the MAX_PEER_TX_ANNOUNCEMENT limit on the Alice - Bob connection. <br>
+<br>
+This network topology configuration was initialized with 20 inbound peers <br>
+connected to Alice, with each a stock of 4600 transactions to announce to <br>
+Alice and the configuration ran for 1 hour. Bob's mempool was accusing <br>
+a deficit of ~10k of transactions at the end of the test. <br>
+<br>
+At the 33th minute, the internal buffer of the `TxRequesterTracker` tracking <br>
+the number of announced transactions reached the max size of 1252, with an <br>
+initial size of 0 (minute 0 ) and a size of 780, at the end of the 60th minute. <br>
+<br>
+https://github.com/ariard/bitcoin/commit/c958f22e4cb7c193378ad7cd1c05b2c331ad6bd5 <br>
+<br>
+This network topology configuration had only one link to be processed by <br>
+Bob i.e the Alice-Bob transaction-relay link. More advanced experimental <br>
+tests of a "low-overflow throughput" attack could be, e.g (non-exhaustive): <br>
+- Bob's node being opened up to `DEFAULT_MAX_PEER_CONNECTIONS` with average tx traffic <br>
+- Bob's node receiving a valid block every 10 min <br>
+<br>
+All those elements are busying the CPUs ressources available to the Bob node, <br>
+and as such it should diminish processing threads available to process the <br>
+"egress" traffic received from Alice, let's say on modern x86_64 chips. <br>
+<br>
+In my reasonable belief, this "low overflow", if it's practical feasibility <br>
+can be demonstrated, is indeed more severe than the "high overflow" variant, <br>
+as there is no external feerate to meet to thwart the propagation of a <br>
+target transaction (e.g a lightning time-sensitive justice transaction). <br>
+The liquidity cost is no more linear on the current value of the <br>
+MAX_PEER_TX_ANNOUNCEMENT limit and the mininal valid transaction size. <br>
+<br>
+<h4>## Solutions</h4>
+<br>
+On the pure lightning-side / contracting protocol implementations and node <br>
+operators, there are 4 mitigations that can be envisioned. I believe the <br>
+mitigation d) can be the more efficient, namely deploying more full-nodes <br>
+singly connected to the transaction-relay initiating node to absorb the <br>
+overflow of transactions. <br>
+<br>
+a) Random transaction rebroadcast: for "low-overflow", a lightning node <br>
+could more aggressively re-sign and rebroadcast time-sensitive transactions, <br>
+probabilistically diminishing the odds of the overflow reaching <br>
+MAX_PEER_TX_ANNOUNCEMENTS. <br>
+<br>
+b) Aggressive fee-rebroadcasting: for "high-overflow" dyamic fee-rebroadcasting <br>
+can asymetrically increase the attack cost. On the other hand, this is increasing <br>
+surface to miner harvesting attacks, where a miner could inject junk children <br>
+traffic to trigger a lightning node to fee-bump time-sensitive transactions [1]. <br>
+<br>
+c) Limitation of "Identical Finality" Time-Sensitive Transactions: for "low-overflow", <br>
+a lightning routing hop could limit the number of transactions with the "identical <br>
+finality" (i.e absolute or relative timelock being final at the same chain tip) to <br>
+limit the worst-case flow of time-sensitive transactions that have to propagate on <br>
+the network, at the same chain-defined time period. <br>
+<br>
+d) Over-provisioning transaction-relay throughput with adjacent full-nodes: both <br>
+for "high-overflow" and "low-overflow", the initial transaction-relay node can <br>
+be made no listening for peers connections and block-relay-only. All the <br>
+transaction-relay connections can be opened to adjacent "trusted" full-nodes, <br>
+that can swallow more of the overflow traffic. Those adjacent full-nodes can <br>
+be regularly connected to the bitcoin network. <br>
+<br>
+Mitigations at the base-layer directly in the transaction-relay stack were not <br>
+seriously considered during the embargo period. In my personal opinion, a <br>
+a robust mitigation against transaction-relay throughput attacks could be <br>
+more efficient at the base-layer, rather than at the lightning / contracting <br>
+protocols levels. <br>
+<br>
+<h4>## Timeline</h4>
+- 2023-06-05: Report of the finding to Bastien Teinturier, Olaoluwa Osuntokun, <br>
+Eugene Siegel, Anthony Towns, Gloria Zhao, Greg Sanders, Matt Corallo, Rusty <br>
+Russell, Suhas Daftuar <br>
+- 2023-06: Discussions among Lightning folks on real-exercise of the finding <br>
+- 2024-07-31: Proposition of a publication date for the finding for December <br>
+- 2024-08: Realistic and deployable mitigations discussed among Lightning folks <br>
+- 2024-11-05: Communication of an exact public disclosure date <br>
+- 2024-12-03: CVE ID Request shared to the MITRE <br>
+<br>
+<h4>## Conclusion</h4>
+<br>
+In this report, a new transaction-relay jamming attack against off-chain protocols <br>
+was introduced by exploiting the throughput limits of a full-node transaction-relay <br>
+selection, announcement and propagation algorithms. This attack appears to be <br>
+plausible against lightning channel funds under real-world scenario, while it <br>
+deserves indeed more investigationg and experiment. <br>
+<br>
+Two variations of the attacks have been presented, a "high-oveflow" variant, <br>
+exploiting the transaction announcement fee-rate sorting algorithm on the <br>
+sender-side, and a "low-overflow" variant, exploiting the announcement processing <br>
+limits on the receiver-side. The first variant is presented with a minimal <br>
+proof-of-concept, while the second variant is left open for future research. <br>
+<br>
+All mistakes and opinions are my own and please verify any information reported. <br>
+<br>
+[0] "...should be always evaluated with regards to base layer network topology, <br>
+*tx-relay propagation rules*, mempools behaviors, consistent policy applied by majority <br>
+of nodes and ongoing blockspace demand. All these components are direct parameters of <br>
+LN security. Due to the network being public, a malicious channel counterparty do have <br>
+an incentive to tweak them to steal from you..." <br>
+<br>
+cf. Pinning: The Good, the Bad, the Ugly: https://gnusha.org/pi/bitcoindev/CALZpt+Ea=GyzEAfJBZzdFvus4_U=x73eA+=J=sN2LONq9_V5dw@mail.gmail.com/ <br>
+<br>
+[1] https://diyhpl.us/~bryan/irc/bitcoin/bitcoin-dev/linuxfoundation-pipermail/lightning-dev/2020-February/002569.txt
