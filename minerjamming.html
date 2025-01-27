@@ -1,0 +1,251 @@
+This report is to fully disclose the variant of replacement cycling attacks <br>
+enabling to censor transaction traffic from miners block template and as such for <br>
+an attacker to achieve a dominant strategy in the distribution of the bitcoin fee <br>
+reward for the generation of blocks in the longuest valid chain among all honest <br>
+mining nodes. <br>
+<br>
+A proof-of-concept of this miner-level attack was tested against a Bitcoin Core <br>
+26.0 branch before my previous disclosure of the 16 October 2023 informing the community <br>
+on how the replace-by-fee mechanism could be used to break the security of the Lightning <br>
+channels. During the last months, it was independently re-discosvered and noticed by <br>
+at least Peter Todd (and I guess few other smart observers...) that replacement cycling <br>
+attacks can affect miners block templates. <br>
+<br>
+While the practicality of replacement cycling attacks in the real-world is still an <br>
+open question among the bitcoin protocol experts, in my personal and humble opinion <br>
+this variant of replacement cycling attack is severe for the perennity of the bitcoin <br>
+ecosystem at large, even more in a post-subsidy world. <br>
+<br>
+The attack shares some similarities with fill-and-dump tricks already known since years <br>
+among mempool experts, yet I think leveraging non-utxo owned transaction traffic, targeting <br>
+properties of a chain of transactions itself to mount those replacement cycling attacks variant <br>
+and combining those techniques in new exploitation model are all novel. <br>
+<br>
+As part of the full disclosure, I'm making the following list of artifacts publicly available. <br>
+<br>
+Test of the feerate differential RCA variant on the classic mempool (bitcoin core branch 26.0 - commit 78b7e955): <br>
+https://github.com/ariard/bitcoin/commits/test-mempool-feerate-differential-rca/ <br>
+<br>
+Test of the timing RCA on the classic mempool (bitcoin core branch 26.0 - commit 78b7e955): <br>
+https://github.com/ariard/bitcoin/commits/test-mempool-timing-rca/ <br>
+<br>
+Test of the feerate differential RCA variant on the cluster mempool (bitcoin core branch 29.0 - commit 5acf12ba): <br>
+https://github.com/ariard/bitcoin/tree/test-mempool-feerate-differential-cluster-rca <br>
+<br>
+Test of the timing RCA variant on the cluster mempool (bitcoin core branch 29.0 - commit 5acf12ba): <br>
+https://github.com/ariard/bitcoin/tree/test-mempool-timig-cluster-rca <br>
+<br>
+Paper summarizing replacement cycling attacks on bitcoin miners block template: <br>
+https://github.com/ariard/mempool-research/blob/2023-10-replacement-paper/rca-bmbt.pdf <br>
+<br>
+Original proof-of-concept RCA on bitcoin miners mempool from October 2023: <br>
+https://github.com/ariard/bitcoin/commits/2023-poc-miner-jamming/ <br>
+<br>
+If you're not already familiar with the idea of replacement cycling attack, I can only <br>
+invite you to read the full disclosure report on how it affects Lightning: <br>
+https://github.com/ariard/mempool-research/blob/2023-10-replacement-paper/replacement-cycling.pdf <br>
+<br>
+<h4> ## Discovery </h4>
+<br>
+During the year 2022, eltoo lightning channels design are discussed, implemented <br>
+and reviewed. In this context and after discussions on mempool anti-DoS rules, I <br>
+discovered that the replace-by-fee mechanism could be leveraged to break Lightning <br>
+channels security. The finding was reported at the near end of 2022 to some bitcoin <br>
+core developers and lightning maintainers. <br>
+<br>
+During the year 2023, mitigations (mainly random rebroadcast of time-sensitive <br>
+second-stage HTLC transactions) are implemented in the major lightning implementations <br>
+and the patched implementations are released for dissemination across the ecosystem <br>
+during the first half of 2023. Date of full disclosure is set for mid-October. <br>
+<br>
+During the first weeks of October, while I was writing more proof-of-concepts and <br>
+doing experimental tests of replacement cycling attacks affecting Lightning, I realized <br>
+that a multi-party transaction could be pinned in the mempool with a branch of junk <br>
+children blocking further RBF or CPFP of the multi-party transasction and once a <br>
+replacement cycling trick have been played to kick out the junk children, the multi-party <br>
+transaction is dropped out of the victim's mempool. <br>
+<br>
+A simple proof-of-concept of this attack variant was immediately shared with the <br>
+bitcoin core sec list members. As the full dislcosure date was already announced <br>
+for the lightning maintainers, I took the initiative to keep the initial schedule <br>
+for the full disclosure of replacement cycling attacks on the lightning network. <br>
+<br>
+During the month of September 2024, Peter Todd published a blog post ("Soft-Fork/ <br>
+Covenant Dependent Layer 2 Review") with a section 4.3 on Replacement Cycling <br>
+pointing out how RCA could be a form of economic exploit on miners. <br>
+<br>
+<h4> ## Background: Block template Construction, Multi-Party Transaction and Replace-by-Fee </h4>
+<br>
+In Bitcoin, all full-nodes are by default participating in the transaction-relay <br>
+network, announcing and broadcasting new transactions to each other. Among the <br>
+full-nodes, miners are specific full-nodes searching for a valid proof-of-work <br>
+to be allowed to add a new block on the chain tip. While searching for a proof-of-work, <br>
+a mining node generates a block template from its local mempools, a cache for <br>
+the unconfirmed transactions. The block template is generally a collection of <br>
+unconfirmed transactions sorted by highest paying fees. Miners are incentivized <br>
+to put transactions in a block template, as there are obtaining the fees. <br>
+<br>
+Among all the bitcoin transaction traffic flowing on the transaction-relay network, <br>
+there are numerous transactions which have being historically and which are still <br>
+multi-party transactions, e.g payout batch transaction, coinjoin transaction, <br>
+lightning liquidity allocating transactions batching, colored coins transactions, etc. <br>
+One aspect of this multi-party transaction is that the inputs and the outputs might <br>
+dissociately belong to a number of users equal or superiors to 2. However, as soon <br>
+as an input or an output are added to a transaction, this enable the owner of this <br>
+transaction component to eventually interferes with the propagation of the transaction. <br>
+<br>
+One mempool mechanism affecting the propagation of a transaction over the transaction-relay <br>
+network is the replace-by-fee policy. Originally sketched out loosely by Satoshi Nakamoto, <br>
+it was implemented in Bitcoin Core 0.12.0, and since them there have many (ongoing) <br>
+refinement to the replace-by-fee policy. Roughly the mechanism works in the following way <br>
+by generating a new transaction with higher absolute fee / higher feerate, an in-mempool <br>
+transaction spending some of the same coin can be kicked out of the mempool. <br>
+<br>
+<h4> ## The Problem: Forgeability of a Miner Block Template Ordering </h4>
+<br>
+When a miner is assembling a collection of transactions to constitute a block template <br>
+for the next block finding, they have to order this block template accordingly to the <br>
+state of their local(s) mempool(s). This state is ordered by the miner to compose the <br>
+highest rewarding block according to some classifying algorithm (e.g ancestor-feerate) <br>
+<br>
+However, the generation of a block template is done "discretely" from the local mempool <br>
+state and this state can be read / write in an open way by transaction-relay peers, by <br>
+abusing the replace-by fee mechanism or the expiration time of transactions, among other <br>
+tricks. <br>
+<br>
+Informally, a local mempool can be computationally forged if the average quantity of <br>
+fees for a single unit is inferior to the attacker's mempool one for a given measurement <br>
+unit (be it virtual bytes or weight), while the forgery cost for the attacker stay under <br>
+the average expected return of engaging in a forgery. <br>
+<br>
+Of course, mempools consistency has never been a design goal of bitcoin transaction-relay <br>
+in a distributed system like the peer-to-peer transaction-relay network, and some amount <br>
+of "forgery" has always been expected. Nevertheless, it appears from testing and analysis <br>
+there can be significant margins of exploitation offered to malicious hashrate adversaries. <br>
+One such margin of exploitation can be instantiated by mounting a replacement cycling attack <br>
+on a miner mempool. <br>
+<br>
+<h4> ## A Simple Replacement Cycling Attack on a Miner Mempool Example </h4>
+<br>
+Let's say Mallet and Mary are both miners with equivalent hashrate capabilities (i.e <br>
+the same odds to mine a block for a given period). Alice is an exchange doing batch <br>
+payment to pay its users withdrawing funds from the exchange. Mary is a solo miner <br>
+with limited CPUs / memory ressources and she is refreshing her mining jobs with a <br>
+`getblocktemplate` only once by minute. <br>
+<br>
+During the setup phase of the attack, Mallet opens 2 low-value accounts at Alice's <br>
+exchange and wait for the time lapse of the next batch payout to be reached to ask <br>
+her 2 accounts to make a deposit. <br>
+<br>
+Alice builds a batch payout transactions with N outputs for her honest users and 2 <br>
+more outputs for Mallet. The transaction is finalized and broadcasts over the network <br>
+of mempools for inclusion in a block template. The Alice batch transaction is of <br>
+size 1000, with ~10 payout for a feerate of 2 satoshis per virtual byte. <br>
+<br>
+As soon as Alice's batch transaction starts to propagate, Mallet consumes its 2 outputs <br>
+with 2 chain of junk transactions to reach max package limits (25 descendants) and block <br>
+the carve-out. The junk transactions are of size 150 bytes and feerates 2 satoshis per <br>
+virtual byte and they have 2 parents: one Alice's payout UTXO and one Mallet's UTXO. <br>
+<br>
+Starting from this point, Alice's exchange server logic should either (a) attempts a CPFP <br>
+or (b) attempts a RBF on the batch transaction. As there is no global mempool, Alice is <br>
+uncertain on the explanation for the lack of propagation of her batch transaction, it is <br>
+most likely she will broadcast a feerate increase in the dark. To replace Alice's parent <br>
+batch transaction and Mallet's junk children transaction, a replace-by-fee must have <br>
+an absolute fee superior to 9800 satoshis. The replace-by-fee transactionis assumed to <br>
+be blocked by Mallet as this absolute fee, so its fees are 9800 satoshis. <br>
+<br>
+The feerate increase transasction (a RBF or CPFP) should be negated by Mallet outbided <br>
+by the constant cycle of replacement junk transaction. As soon as the RBF or CPFP has <br>
+been re-cycled out for a give period, the chain of junk replacement transaction can <br>
+be re-attached on another package to provoke a higher replace-by-fee from Alice's server. <br>
+<br>
+If the counter-square of the Alice's RBF and the subsequent replacement out of Mallet's <br>
+transaction is achieved before Mary is fetching the latest highest feerate group of the <br>
+mempools, she should only get Alice root's batch transaction and Mallet's junk children <br>
+transactions. <br>
+<br>
+At equal odds of mining blocks, the absolute fees yield by their respective block template <br>
+is the following: <br>
+- Mary's block template: 9800 satoshis <br>
+- Mallet's block template: 17600 satoshis <br>
+<br>
+The question is from where Mallet's advantage is coming. As the owner of the utxos used <br>
+to build the chain of junk transactions, he can cumulate both spending Alice's utxo with <br>
+her own replace-by-fee transaction and a withhold chain of new transactions spending his <br>
+non-collaborative UTXOs. Mary is only seeing in her mempool the latest result of mempool <br>
+acceptance, and not the highest combination of absolute fees for a combination of given <br>
+UTXOs. <br>
+<br>
+It should be noted, the advantage of Mallet can be diluted with the number of replacement <br>
+cycling done to block the fee-bump of Alice's batch transaction, due to the RBF penalty. <br>
+However, the penalty can be compensated by targetting many unrelated multi-party transactions. <br>
+<br>
+<h4> ## Solutions </h4>
+<br>
+I'm marking few solutions that could improve replacement cycling attacks on miners block <br>
+template, while their exact efficiency is still a subject to be analyzed. <br>
+<br>
+Cluster mempool: this is a proposal to associate each unconfirmed transaction in a mempool <br>
+with related transactions, creating a cluster. Each cluster contains feerate-sorted chunks <br>
+consisting one or more transactions. Ideally, the cluster mempool would allow to build more <br>
+efficient eviction and replacement algorithms on top of it. In the context of RCA on miners, <br>
+it could potentially diminish the differential that can be generated at the advantage of the <br>
+attacker. <br>
+<br>
+Replace-by-Feerate: this is proposal to allow replacement to only happen when it would <br>
+immediately bring a transaction close enough to the top of the mempool to be mined in the <br>
+next block or so. In the context of RCA on miners, this could increase the jamming cost <br>
+burdened by the attacker. <br>
+<br>
+Chain of Transactions Topological Restrictions: currently, full-node mempool are generally <br>
+allowing 25 ancestors and 25 descendants by default. By restraining the topological dimensions <br>
+of a chain of transaction, this renders the computation of mempool algorithms more tractable. <br>
+In the context of RCA on miners, this might have the indifrect effect to potentially diminish <br>
+the differential that can be generated at the advantage of the attacker. <br>
+<br>
+UTXO-based Transaction Announcement: currently, transaction-relay is only done based on the <br>
+txid or wtxid of a transaction. In the future, the best feerate known for a set or subset <br>
+of UTXOs could be propagated among nodes, before they proceed to the actual transaction relay. <br>
+In the context of RCA on miners, an enhanced mempool could be re-download the best known <br>
+in the past transaction branch for a UTXO, if there is subsequent downgrade of the best <br>
+feerate branch for this same given UTXO. <br>
+<br>
+<h4> ## Timeline </h4>
+<br>
+- 2022-12: Report of the replacement cycling attacks on lightning channel to a selected <br>
+group of bitcoin core contributors and lightning maintainers <br>
+- 2023-06: Week of mid-october 2023 proposed for full disclosure of replacement cycling attacks <br>
+on the Lightning Network <br>
+- 2023-08-10: CVEs assigned by MITRE for the Lightning project <br>
+- 2023-10-05: Pre-disclosure of LN CVEs numbers and replacement cycling attack existence <br>
+to security@bitcoincore.org <br>
+- 2023-10-15: Finding that replacement cycling attack can put a DoS risk on multi-party <br>
+transactions and the hypothetical effect on miners mempools ; Sharing of a proof-of-conceptual test <br>
+to security@bitcoincore.org <br>
+- 2023-10-16: Full disclosure of CVE-2023-40231 / CVE-2023-40232/ CVE-2023-40233 / CVE-2023-40234 <br>
+and replacement cycling attacks <br>
+- 2024-09-02: Peter Todd publishes a public blog post analysis some soft-fork proposals and in <br>
+this post loosely mention the potential effect of RCA on miners <br>
+- 2024-09-07: Sharing to Peter Todd, Antoine Poinsot and Greg Maxwell the proof-of-conceptual <br>
+test of RCA at the miner-level and hypothesis <br>
+- 2024-09-30: Sharing additional info on RCA at the miner-level to the same group of 4 with <br>
+the addition of Michael Ford, Ava Chow and Eric Voskuil ; Proposal for a disclosure in the last <br>
+weeks of January <br>
+- 2025-01-27: Full disclosure of "Replacement Cycling Attacks on Bitcoin Miners Block Templates" <br>
+<br>
+<h4> ## Conclusion </h4>
+<br>
+By leveraging the replace-by-fee and mempool mechanisms of a mempool, an adversarial miner <br>
+can deliberately jam the quality of its competitors block template, and gain an advantage <br>
+in the gloabl distribution of the fee reward coming from confirmed transactions. While the <br>
+exact practicality of this attack is still to be investigated, the main tricks have been <br>
+tested both on a classic mempool on a bitcoin core running a 26.0 branch and cluster-based <br>
+mempool on a bitcoin core node running a 29.0 branch. <br>
+<br>
+Do not trust, verify. All mistakes and opinions are my own. <br>
+<br>
+Antoine <br>
+<br>
+"trust yourself when all men doubt you, <br>
+but make allowance for their doubting too" - K <br>
