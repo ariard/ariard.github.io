@@ -1,0 +1,265 @@
+This report is to disclose a vector of attack affecting bitcoin time-sensitive <br>
+contract protocols, specifically the lightning network by exhausting the fee-bumping <br>
+reserves of a anchor-upgraded channels of a lightning node. <br>
+<br>
+This attack vector has been known since the early days of anchor output deployment <br>
+over the network circa end of 2020 and it has been discussed among LN maintainers <br>
+since circa mid 2022. While few basic mitigations have been developed and shipped <br>
+in LN implementations over the last few years, it is believed that more robust <br>
+mitigations can only be deployed at the protocol-level, thus unlikely to happen <br>
+with an embargoed process. <br>
+<br>
+This class of attacks dubbed "fee-bumping reserves exhaustion attacks" is <br>
+tracked at the protocol-level by CVE-2025-27586. As as far as it is understood <br>
+it is affecting LN routing nodes (i.e a double-spent of an incoming / outgoing <br>
+HTLC) and LN payee (i.e revealing a preimage with `update_fulfill_htlc` and <br>
+double-spent with a HTLC-timeout). This is indeed a money stealing kind of attacks. <br>
+<br>
+While the attacks have not been tested under real-world configurations, they're <br>
+deemed as feasible, with the caveat of round guessing the level of fee-bumping <br>
+reserves for the adversary (see corresponding section). If you're running a <br>
+LN node with subsequent funds at stake and deployed `option_anchor` channels <br>
+channels, I uphold to reach out to the maintainers of your run LN implementations <br>
+for tailored recommendations on how to adjust your fee-bumping reserves (some <br>
+LN implementations are monolothic stacks, some are more modular not shipping with <br>
+a wallet and here efficient mitigations is very tight with your L1 wallet). <br>
+<br>
+The report is organized in the following fashion: <br>
+- background on LN fee-bumping <br>
+- explanation of the problem <br>
+- the challenge: detecting a node fee-bumping reserves from the outside <br>
+- lightning mitigations <br>
+- second-layers impact <br>
+- discovery <br>
+- timeline <br>
+<br>
+<h4> ## Background: Lightning Fee Estimation, Legacy Channel and `option_anchor` </h4>
+<br>
+Historically, the responsibility for fees has been on the channel initiator <br>
+(i.e the channel forwarding first the `open_channel` msg). The fees feeding <br>
+both counterparties commitment transaction is substracted from the initiator <br>
+balance (`funding.is_outbound()` in LDK). The feerate determinating the level <br>
+of absolute fees committed is set by the flow of `update_fee` message. <br>
+<br>
+That msg is forward by the channel initiator with a `feerate_per_kw`. If <br>
+the recipient estimates from its local fee-estimation that the feerate is <br>
+good enough for timely processing and not unreasonably large, the feerate is <br>
+accepted. This feerate is used to build the local and remote's versions <br>
+of the commitment transactions and the respective set of second-stage HTLC <br>
+transactions (`build_htlc_transaction()` in LDK). <br>
+<br>
+With this legacy mode of fee-bumping, all the fee-bumping liquidity is <br>
+coming out of the channel initator balance (i.e the `to_local` or `to_remote` <br>
+output accordingly), of which this balance is theorically the upper limit <br>
+to fee-bump a version of the commitment tx and its second-stage HTLCs. <br>
+<br>
+As of today, this `update_fee` mechanism is still supported by LN implems <br>
+and this mechanism is still part of the BOLTs specification (BOLT #2 "Updating <br>
+Fees: `update_fee`). However, as it has been well-established and understood <br>
+by the LN community since a long time, this mechanism does not work very well <br>
+in an environment with dynamic fees. Indeed, the pre-signed feerates at time <br>
+T might not suffice to get into a block at time T + 100. Additionally, there <br>
+is no guarantee that the channel counterparty is online or cooperative at time <br>
+T + 100 to re-sign a pair of commitment transaction with enhanced feerates. <br>
+<br>
+Therefore, since 2018, the LN community has been working on the anchor output <br>
+upgrade, i.e adding a pair of dedicated outputs on each version of the commitment <br>
+transaction (i.e historically `option_anchor_outputs` then `option_anchors_zero_fee_htlc_tx`, <br>
+now `option_anchors`). This anchor output mechanism allows a LN node to attach <br>
+unilaterally a child-pay-for-parent on the commitment transaction it has to <br>
+include in a block. <br>
+<br>
+Making abstraction of any transaction-relay issue, the CPFP can constitute a <br>
+fee-bump of the overall package (the commitment tx + the cpfp tx), which is <br>
+increasing its feerate to increase the odds its block inclusion. In case of <br>
+time-sensitive HTLC outputs to claim (e.g a HTLC-preimage to claim a "received" <br>
+output or a HTLC-timeout to claim a "offered" output), timely inclusion in <br>
+blocks matters for a LN node. <br>
+<br>
+As of today, the `option_anchor` is not the default for LDK (v0.0.124 - <br>
+src/util/config.rs), is the default for LND (v.19.0-beta - sample-lnd.conf), <br>
+is the default for Core-Lightning (v.25.02 - lightningd/options.c). Eclair has <br>
+not been checked because it's in Scala. <br>
+<br>
+<h4> ## Problem: Lack of Fee-Reserves Provisioning for Anchor Outputs Fee-Bumping </h4>
+<br>
+While the anchor output mechanism allows non-interactive fee-bumping of <br>
+a commitment transaction, the original specification of anchor output never <br>
+mentions, neither indicates how the now external fee-bumping reserves should <br>
+be provisioned LN node and if any reactive actions should be undertake in <br>
+face of network mempools congestions or high block inclusion median feerate [1]. <br>
+<br>
+The lack of fee-reserves provisioning exposes a LN node to a fee-bumping <br>
+reserve exhaustion attack, where a malicious counterparty triggers inflation <br>
+of the LN node's channel surface to exhaust the limited fee-bumping reserves. <br>
+<br>
+E.g if Alice's commitment transaction is pre-signed at 1 sat / vb, the <br>
+current size is 2000 bytes and the top block feerates ranks at 10 sat / vb, <br>
+Alice should have at least 19000 sats of fee-bumping reserves. <br>
+<br>
+Still, even if Alice has a sufficient level of reserves, if the channel's <br>
+`max_accepted_htlcs` is uncapped (i.e up to the protocol limit of 483 HTLCs <br>
+one-side), the channel counterparty Bob can inflate the size of the commitment <br>
+transaction (e.g from 2000 bytes to 4000 bytes) up until Alice's fee-bumping <br>
+reserves are exhausted. <br>
+<br>
+E.g if Alice, a routing node, has a pending HTLC of value 30k sats, and she has <br>
+only 20k satoshis of reserves, if the block feerate is to be over 10 sats / vbyte <br>
+up until the HTLC expires at block T=150, she won't be able to include her commitment <br>
+tx, before an incoming HTLC expires at block T=100. <br>
+<br>
+In the lack of a monitored `max_channel_weight_surface` for each opended channel <br>
+binded with fee-bumping reserves, a LN node is exposed to diverse fee-bumping <br>
+reserve exhaustion attacks. <br>
+<br>
+Generally, there are 3 injection vectors that a LN counterparty, or a third-party <br>
+that can route through a channel opened with the target node, to inflate a LN node <br>
+global channel surface: <br>
+- opening more inbound channels <br>
+- asks for more outbound channels (e.g by buying Just-in-Time channels) <br>
+- routing more offered / received HTLCs on an existent given channel <br>
+<br>
+This class of attacks is dependent on the level of networks mempools congestion, <br>
+as with more congestions spikes in, more channels are exposed to the attack. The <br>
+attack difficulty of execution is deemed as medium, as only direct peering or <br>
+indirect peering with the target node is necessary and visibility on the ongoing <br>
+networks mempools congestion. <br>
+<br>
+For what is concerning, the adversy cost, it is limited as the on-chain fees <br>
+to open more inbound channels, out-of-band fees to open more outbound channels. <br>
+It is unfairly cheap if the attack vector of routing HTLCs to inflate the size <br>
+of the LN channel is leveraged, as off-chain fees are only currently paid in <br>
+case of success for LN. An adversary only has to overbid at the current block <br>
+inclusion feerate and the break even threshold is reached as long as the HTLC's <br>
+`amount_msat` is superior to the fee cost. <br>
+<br>
+<h4> ## Detecting a Node Fee-Bumping Reserves from the Outside </h4>
+<br>
+There is one main challenge for an adversary which is worth of awareness, namely <br>
+guessing the fee-bumping level of reserves of a target node, before to launch <br>
+a fee-bumping reserve attack. Indeed, while LN implementations have pre-configured <br>
+level of fee-bumping reserves automatically allocated which can be observed from <br>
+the code source of the diverse LN implementations, a LN node could have consequential <br>
+UTXO reserves in one or more L1 wallets. <br>
+<br>
+A first deanonymization heuristic to bound the fee-bumping reserves level can be <br>
+to trigger a unilateral force close with a "decoy" test. E.g at block inclusion feerate <br>
+X, for 2 public channels provokes a force-close of channel 1 and observe if the <br>
+target node Y is going to match the inclusion feerate for X with its CPFP attached <br>
+to channel 1. If yes, the adversary can estimate that the same level of reserves holds <br>
+for channel 2. If no, the adversary can estimate that public channel is probably <br>
+exposed to a FBRE attack. <br>
+<br>
+This deanonymization heuristic can be generalized on long-tend stastical observations <br>
+of a LN node by snitching all its unilateral force-closures from the on-chain txn logs. <br>
+<br>
+A second tupe deanonymization heuristic can be to observe the interactions with <br>
+the base-layer and the UTXO management, e.g based on which BTC addresses are consumed <br>
+to feed the outbound channels opening, or the dual-funding channel opening by the <br>
+target node (i.e all the operations of replenishment, funding, payment, settlement <br>
+or collection) [2]. <br>
+<br>
+One should make the observations that for L1 wallets coins to be leveraged as <br>
+fee-bumping reserves, the L1 wallet should be sufficently "hot" to be used in the <br>
+time span granted by the lowest safety timelock for a deployed channel. <br>
+<br>
+<h4> ## Lightning Mitigations </h4>
+<br>
+On the range of mitigations that can be implemented by a LN implementation <br>
+there are 3 complementary plausible lines: <br>
+- 1) over-provisioning fee-bumping reserves <br>
+- 2) halting the increase of the LN node's all-channels's `max_channel_weight_surface` <br>
+- 3) cooperatively collaboring with LN peers to downcrease its local `max_channel_weight_surface`. <br>
+<br>
+About the 1), which is the more obvious, the idea is for a LN node to over-provision <br>
+the fee-bumping reserves with the following formula: `current_opened_channel` * <br>
+`max_channel_weight_surface` * `worst_case_feerate_per_kw` / 1000. For the `worst_case_feerate_per_kw`, <br>
+it's the hardest parameter to select, as while historical worst mempools network congestion <br>
+level are good empirical points, there are no guarantee of the future worst-case level of <br>
+congestion. Over-provisioning fee-bumping reserves for a node is coming with a high liquidity <br>
+downside. <br>
+<br>
+About 2), the idea is to stop accepting inbound channels, if the local level of fee-bumping <br>
+reserves is falling under implemenetation-defined or operation-defined threshold. E.g Core-Lighting <br>
+has a `min-emergency-msat` option field tfor that purpose. This threshold can be extended for <br>
+outbound channel reserve and the addition / removal of HTLCs outputs on a commitment transactions, <br>
+i.e to reject HTLCs if the local fee-bumping reserves is too low. <br>
+<br>
+About 3), the idea is along a payment path, the LN node partaking in the routing of the <br>
+HTLC could collaborate to unlash the locked HTLC on each hop, starting by the end to <br>
+allow each local node to compress their commitments transaction size. This would assume <br>
+some kind of interactivity happening successfully among each pair of LN nodes, and a new <br>
+option in the `node_announcement`, e.g `option_unlock_htlc`. It can be especially valuable  <br>
+for long-term HTLC kind of traffics (e.g the ones for swaps). <br>
+<br>
+The LN implementations (LDK, LND, Core-Lighting, Eclair) implements different levels <br>
+of those mitigations. It is an open research question if more types of practical <br>
+mitigationscan be envisioned, implemented and deployed. <br>
+<br>
+<h4> ## Second-Layers Impact </h4>
+<br>
+As far as it's understood, this class of fee-bumping reserves attacks <br>
+is generally affecting any contract protocol or multi-party transactions, <br>
+where counterparties have a competing interest in concurrent and exclusive <br>
+confirmations of a set of transactions. In the presence of anchor output, <br>
+though in the lack of dynamic fee-bumping reserves management carefully <br>
+implemented, all lead to think use-cases described following the "contract <br>
+protocol" pattern can be more or less affected. <br>
+<br>
+<h4> ## Discovery </h4>
+<br>
+In 2020, a draft for anchor output submitted to the bolts. The anchor output <br>
+upgrades is designed to be a complete overhaul of the dynamic fee-management <br>
+for lightning channels, in a move way static fees only legacy channels. Initial <br>
+finding of economic pinning against lightning commitment and second-stage HTLC <br>
+transactions. <br>
+<br>
+End of 2020, in the context of implementing a first version of anchor output <br>
+in rust-lightning [0], I realize that **spoiler alert** (a) Santa Clause does not <br>
+exist, as such (b) there will be no one to magically fulfill a lightning node <br>
+fee-bumping reserves for `option_anchor_outputs` just on time in case of unilateral <br>
+force-closure of a channel. This state of things could open the door to a counterparty <br>
+inflating the number of opened channels and their weight units sizes to induce <br>
+adversarial exploitations. <br>
+<br>
+Being already busy with numerous other vulnerabilities at the time in 2020, including <br>
+the one that lead to the transition from `option_anchor_outputs` to `option_anchors_zero_fee_htlc_tx` <br> 
+[4], I only reported the finding to a selected group of LN maintainers and devs in <br>
+July 2022. From then on, attacks vectors and ideas of efficient mitigations have been <br>
+discussed. <br>
+<br>
+<h4> ## Timeline </h4>
+<br>
+- 2022-07-11: Report of the finding to XXX, Bastien Teinturier (Eclair), Lisa Neigut <br>
+(C-lightning), YYY and Eugene Siegel (LND) <br>
+- 2022-07-17: Sharing to Olaoluwa Osuntunkun (LND) <br>
+- 2023-05-25: Sharing to Rusty Russell (C-Lightning), Fabrice Drouin (Eclair) and ZZZ <br>
+- 2023-07-25: Full disclosure put on ice until anchor output support in LDK <br>
+- 2025-02-27: Proposal of a full disclosure date in early weeks of June. <br>
+- 2025-03-03: CVE assigned by MITRE <br>
+- 2025-06-16: Full disclosure of CVE-2025-27586 and fee-bumping reserve exhaustion attacks <br>
+<br>
+<h4> ## Conclusion </h4>
+<br>
+In this report, a new protocol-level attacks against bitcoin time-sensitive contract <br>
+protocols, specifically the LN, was introduced by exploiting the lack of a fee-reserves <br>
+provisioning mechanism to provide on-time sufficient fees amount for fee-bumping CPFP <br>
+attached on anchor output. This attack appears to be plausible against `option_anchors` <br>
+lightning channels funds under real-world scenario, while it deserves indeed more <br>
+investigation and experiment. <br>
+<br>
+One challenge is effectively exploiting this vector of attacks is roughly guessing <br>
+the level of fee-bumping reserves available to the target LN node. While adequate <br>
+provisioning or just-in-time halting of the increase of a LN node all channels's <br>
+`max_channel_weight_surface` consistute a robust mitigation, more mitigations at <br>
+the protocol-level might alleviate the stuck liquidity burden coming as a downside <br>
+of such mitigations. <br>
+<br>
+Do not trust, verify. All mistakes and opinions are my own. <br>
+<br>
+Antoine <br>
+<br>
+[0] https://github.com/lightningdevkit/rust-lightning/pull/642 <br>
+[1] https://github.com/lightning/bolts/pull/688 <br>
+[2] https://arxiv.org/abs/2007.00764 <br>
+[4] https://diyhpl.us/~bryan/irc/bitcoin/bitcoin-dev/linuxfoundation-pipermail/lightning-dev/2020-September/002800.txt <br>
